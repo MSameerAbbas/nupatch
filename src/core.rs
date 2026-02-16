@@ -182,9 +182,18 @@ fn discover_vars(code: &str) -> Result<DiscoveredVars, String> {
     let has_naive_case = code.contains(&naive_case_str);
     let nu_detection_str = format!(r#".includes("nu")?{enum_var}.Naive"#);
     let has_nu_detection = code.contains(&nu_detection_str);
+    // Check specifically for the NEW insertion position: right after the
+    // first ?<enum>.PowerShell: in detectShellType. The marker is
+    // `?<enum>.PowerShell:<cmdExists>("nu")?<enum>.Naive:`.
     let has_system_nu = cmd_exists_fn
         .as_ref()
-        .map(|f| code.contains(&format!(r#"{f}("nu")"#)))
+        .map(|f| {
+            let marker = format!(
+                r#"?{ev}.PowerShell:{f}("nu")?{ev}.Naive:"#,
+                ev = enum_var
+            );
+            code.contains(&marker)
+        })
         .unwrap_or(false);
     // Match specifically our patch: ?.shell??<var>?.userTerminalHint??
     // The trailing ?? distinguishes this from the original .userTerminalHint
@@ -225,7 +234,8 @@ fn quick_detect(code: &str) -> Option<QuickDetect> {
     let re_uth = lazy_re!(r"\.shell\?\?\w+\?\.userTerminalHint\?\?");
     let has_uth = re_uth.is_match(code).unwrap_or(false);
 
-    // System-level nu detection: find cmd_exists function name, check for ("nu")
+    // System-level nu detection: find cmd_exists function name, then check
+    // for the specific NEW position marker: ?<enum>.PowerShell:<fn>("nu")?<enum>.Naive:
     let re_cmd = lazy_re!(
         r"function\s+(\w+)\(\w+\)\{try\{return\(0,\w+\.\w+\)\(\w+,\[\]\)\.cmd!==\w+\}"
     );
@@ -234,7 +244,12 @@ fn quick_detect(code: &str) -> Option<QuickDetect> {
         .ok()
         .flatten()
         .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-        .map(|f| code.contains(&format!(r#"{f}("nu")"#)))
+        .map(|f| {
+            let marker = format!(
+                r#"?{enum_var}.PowerShell:{f}("nu")?{enum_var}.Naive:"#
+            );
+            code.contains(&marker)
+        })
         .unwrap_or(false);
 
     Some(QuickDetect {
@@ -323,11 +338,12 @@ fn patch_nu_detection<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, str>, S
 /// Insert a `<cmdExists>("nu")` system-level check in `detectShellType` so
 /// nushell is detected from PATH even when the hint/env doesn't mention it.
 ///
-/// The final fallback chain in `detectShellType` is:
-///   `...<cmdExists>("pwsh")||<cmdExists>("powershell")?<enum>.PowerShell:<enum>.Naive}`
-///
-/// We insert `<cmdExists>("nu")?<enum>.Naive:` before that final `<enum>.Naive}`
-/// so nushell-on-PATH wins over the fallback.
+/// The detection chain has hint-based string checks followed by system-level
+/// `commandExists` checks. On Windows, the system-level PowerShell check
+/// always fires (PowerShell is always installed), making anything after it
+/// unreachable. We insert `<cmdExists>("nu")?<enum>.Naive:` right after the
+/// first `?<enum>.PowerShell:` (the hint-based PowerShell arm), which places
+/// it before the system-level PowerShell checks.
 fn patch_system_nu_detection<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, str>, StepResult) {
     if v.has_system_nu {
         return (
@@ -349,41 +365,51 @@ fn patch_system_nu_detection<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, 
         }
     };
 
-    // The end of detectShellType is: ...?<enum>.PowerShell:<enum>.Naive}
-    // We find the LAST occurrence of this pattern (rfind) to target the
-    // final fallback, not an earlier duplicate in the detection chain.
-    let tail_pattern = format!(
-        "{ev}.PowerShell:{ev}.Naive}}",
-        ev = v.enum_var
-    );
-    let tail_idx = match code.rfind(&tail_pattern) {
+    // Find the detectShellType region (starts at the includes("zsh") pattern).
+    let zsh_pattern = format!(r#"{}.includes("zsh")"#, v.hint_var);
+    let zsh_idx = match code.find(&zsh_pattern) {
         Some(idx) => idx,
         None => {
             return (
                 Cow::Borrowed(code),
                 StepResult::fail(
                     "System nu detection",
-                    format!("Cannot find `{tail_pattern}` at end of detectShellType"),
+                    "Cannot find detectShellType region",
                 ),
             );
         }
     };
 
-    // Insert point: right before <enum>.Naive} (after <enum>.PowerShell:)
-    let ps_colon = format!("{}.PowerShell:", v.enum_var);
-    let naive_start = tail_idx + ps_colon.len();
+    // Find the first ?<enum>.PowerShell: after the hint checks. This is the
+    // end of the hint-based PowerShell arm; inserting right after the ":"
+    // places our system nu check before any system-level PowerShell checks.
+    let ps_marker = format!("?{}.PowerShell:", v.enum_var);
+    let ps_offset = match code[zsh_idx..].find(&ps_marker) {
+        Some(idx) => idx,
+        None => {
+            return (
+                Cow::Borrowed(code),
+                StepResult::fail(
+                    "System nu detection",
+                    format!("Cannot find `{ps_marker}` in detectShellType"),
+                ),
+            );
+        }
+    };
+
+    let insert_at = zsh_idx + ps_offset + ps_marker.len();
     let insertion = format!(
         r#"{cmd_exists}("nu")?{ev}.Naive:"#,
         ev = v.enum_var
     );
 
     let mut new_code = String::with_capacity(code.len() + insertion.len());
-    new_code.push_str(&code[..naive_start]);
+    new_code.push_str(&code[..insert_at]);
     new_code.push_str(&insertion);
-    new_code.push_str(&code[naive_start..]);
+    new_code.push_str(&code[insert_at..]);
 
-    let ctx_start = naive_start.saturating_sub(40);
-    let ctx_end = (naive_start + insertion.len() + 40).min(new_code.len());
+    let ctx_start = insert_at.saturating_sub(40);
+    let ctx_end = (insert_at + insertion.len() + 40).min(new_code.len());
     let detail = format!(
         "Insertion: {}\nContext:   ...{}...",
         insertion,
@@ -392,7 +418,7 @@ fn patch_system_nu_detection<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, 
 
     (
         Cow::Owned(new_code),
-        StepResult::ok("System nu detection", "Inserted PATH-based nu check before final fallback")
+        StepResult::ok("System nu detection", "Inserted PATH-based nu check after hint-based PowerShell")
             .with_detail(detail),
     )
 }
@@ -759,7 +785,7 @@ const CLI_PLAN: PatchPlan = PatchPlan {
         ("Naive case", patch_naive_case),
     ],
     is_fully_patched: |d| d.has_nu && d.has_system_nu && d.has_naive_case,
-    restore_before_patch: false,
+    restore_before_patch: true,
 };
 
 /// Patch the CLI agent file. Applies nu detection and Naive executor case.

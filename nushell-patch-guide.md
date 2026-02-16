@@ -36,12 +36,12 @@ The `NaiveTerminalExecutor` class (spawns `shell -c "command"`) already exists a
 
 **CLI agent** (3 patches):
 1. **Nu detection**: Adds `includes("nu")?ShellType.Naive:` **before** the PowerShell condition in `detectShellType()` so nushell is recognized from hints (placement is critical -- after the PowerShell check is unreachable on Windows)
-2. **System nu detection**: Adds `commandExists("nu")?ShellType.Naive:` before the final fallback in `detectShellType()` so nushell is detected from PATH even without `$env:SHELL`
+2. **System nu detection**: Adds `commandExists("nu")?ShellType.Naive:` right after the first (hint-based) `?PowerShell:` arm in `detectShellType()`, placing it before the system-level PowerShell checks so it's reachable on Windows where PowerShell is always installed
 3. **Naive case**: Adds `case ShellType.Naive:` in the executor factory with `findActualExecutable("nu")` PATH-based shell resolution (no `$env:SHELL` required)
 
 **IDE agent** (4 patches + integrity chain):
 1. **Nu detection**: Same `includes("nu")` detection before the PowerShell condition
-2. **System nu detection**: Same `commandExists("nu")` PATH-based check
+2. **System nu detection**: Same `commandExists("nu")` PATH-based check (on the IDE, placed after the combined hint+system PowerShell arm -- unreachable on Windows, but the IDE relies on `userTerminalHint` instead)
 3. **userTerminalHint**: Wires `userTerminalHint` into the shell resolution function (`ce()`) so the IDE's configured shell path (from `terminal.integrated.defaultProfile.windows`) is used by `NaiveTerminalExecutor`
 4. **Shell path fallback**: Adds `case ShellType.Naive:` to `getShellExecutablePath()` (`Se()`) with `findActualExecutable("nu")` and fixes the `default:` case to return PowerShell on Windows instead of `/bin/sh`
 5. Updates the SHA-256 hex hash in `extensionHostProcess.js` and the base64 checksum in `product.json`
@@ -74,7 +74,7 @@ findActualExecutable("nu") → process.env.SHELL → PowerShell on Windows / "/b
 - `new <NaiveExec>(<cwd>, {..., shell:})` — discovers `NaiveTerminalExecutor`
 - `function <func>(<arg>){try{return(0,<mod>.findActualExecutable)(<arg>,[]).cmd!==<arg>}` — discovers `cmdExists` function name and `findActualExecutable` call pattern
 - `<hint>.includes("pwsh")` — discovers the nu-detection insertion point (must be before this)
-- `<enum>.PowerShell:<enum>.Naive}` — discovers the system detection insertion point
+- `?<enum>.PowerShell:` (first occurrence in detectShellType) — discovers the system detection insertion point (insert right after it, before the system-level PowerShell checks)
 - `<var>?.shell??` — discovers the shell resolution insertion point for `userTerminalHint`
 - `default:return process.env.SHELL||"/bin/sh"` — discovers the `Se()` fallback to patch
 
@@ -91,7 +91,7 @@ nupatch status                 # check current patch state
 
 ### After patching
 
-- **CLI**: `nu` must be on PATH. No `$env:SHELL` needed — the patcher uses `findActualExecutable("nu")` for auto-discovery.
+- **CLI**: `nu` must be on PATH. No `$env:SHELL` needed — `detectShellType` checks `commandExists("nu")` before the system-level PowerShell checks, and the Naive case uses `findActualExecutable("nu")` for shell path resolution.
 - **IDE**: Full quit + relaunch (check system tray for lingering Cursor processes)
 - **IDE settings**: Set `terminal.integrated.defaultProfile.windows` to your Nushell profile. Use literal paths (not `${env:USERPROFILE}`) to avoid VS Code variable resolution issues.
 
