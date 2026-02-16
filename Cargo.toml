@@ -1,0 +1,22 @@
+[package]
+name = "nupatch"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+description = "Patch Cursor IDE to use Nushell instead of PowerShell on Windows"
+repository = "https://github.com/MSameerAbbas/nupatch"
+
+[dependencies]
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+color-eyre = "0.6"
+fancy-regex = "0.17"
+richrs = "0.2"
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "z"
+codegen-units = 1
