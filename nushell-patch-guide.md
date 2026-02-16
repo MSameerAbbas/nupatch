@@ -32,6 +32,143 @@ Cursor's agents use a shared shell execution library with several bugs:
 
 The `NaiveTerminalExecutor` class (spawns `shell -c "command"`) already exists and works with nushell. It just needs to be routed to with the correct shell path.
 
+## Minified Code Structure
+
+> Last verified: CLI `agent-cli@2026.02.13-41ac335`, IDE `v2.4.37`.
+> Minified names change across versions, but the structure is stable.
+
+### `detectShellType` -- the core routing decision
+
+**CLI** (`qe(e)`) -- string checks and system checks are **separate** arms:
+```javascript
+function qe(e) {
+  if (e === V.ZshLight) return V.ZshLight;
+  const t = e || process.env.SHELL || "";
+  const n = e ? void 0 : Ue();                    // MSYSTEM git-bash check
+  const r = void 0 !== n || /git.*bash\.exe$/i.test(t) || ...;
+
+  // --- hint-based checks (from userTerminalHint / $env.SHELL) ---
+  return t.includes("zsh")  ? V.Zsh
+       : t.includes("bash") && r ? V.Bash
+       : t.includes("pwsh") || t.includes("powershell") ? V.PowerShell
+  // --- system-level checks (commandExists probes) ---
+       : n ? V.Bash                                      // MSYSTEM bash
+       : Qe("pwsh") || Qe("powershell") ? V.PowerShell   // <-- always true on Windows
+       : Qe("zsh")  ? V.Zsh
+       : Qe("bash") && r ? V.Bash
+       : Qe("pwsh") || Qe("powershell") ? V.PowerShell   // redundant duplicate
+       : V.Naive;
+}
+```
+Key: the system-level PowerShell check (`Qe("pwsh")||Qe("powershell")`) fires before any `Qe("nu")` could be inserted after it, making everything below it **dead code on Windows**.
+
+**IDE** (`Te(e)`) -- hint + system PowerShell checks are **combined** in one arm:
+```javascript
+function Te(e) {
+  if (e === O.ZshLight) return O.ZshLight;
+  const t = e || process.env.SHELL || "";
+  const r = "win32" === process.platform;
+  const n = /git.*bash\.exe$/i.test(t) || ...;
+  const s = !r || n;
+
+  return t.includes("zsh")  ? O.Zsh
+       : t.includes("bash") && s ? O.Bash
+       // vvv combined: string match OR system probe -- always true on Windows vvv
+       : t.includes("pwsh") || t.includes("powershell")
+         || r && (Ie("pwsh") || Ie("powershell")) ? O.PowerShell
+       // ^^^ everything after this is dead code on Windows ^^^
+       : Ie("zsh")  ? O.Zsh
+       : Ie("bash") && s ? O.Bash
+       : Ie("pwsh") || Ie("powershell") ? O.PowerShell
+       : O.Naive;
+}
+```
+The IDE merges the `includes("pwsh")` string check with `isWindows && (commandExists(...))` in a single `||` chain, so the PowerShell arm fires even when `$env.SHELL` is unset.
+
+### `commandExists` -- PATH probe
+
+```javascript
+// CLI: Qe(e)          IDE: Ie(e)
+function commandExists(e) {
+  try { return findActualExecutable(e, []).cmd !== e; }
+  catch(e) { return false; }
+}
+```
+Returns `true` if the binary resolves to a real path (i.e. is on PATH).
+
+### Executor factory -- how `ShellType` maps to an executor
+
+**IDE** (`be(e, t)`) -- `default` creates `NaiveTerminalExecutor` via `ce(e)`:
+```javascript
+switch (t) {
+  case O.Zsh:       return new te(fe(e));       // LazyExecutor(zsh setup)
+  case O.Bash:      return new te(X(e));        // LazyExecutor(bash setup)
+  case O.PowerShell:return new te(ie());        // LazyExecutor(pwsh setup)
+  case O.ZshLight:  return new te(we(e));       // LazyExecutor(zsh-light setup)
+  default:          return ce(e);               // NaiveTerminalExecutor directly
+}
+```
+No `case O.Naive:` is needed because the `default` already routes there.
+
+**CLI** -- `default` calls `Te(t)` which creates `NaiveTerminalExecutor` (`ve`):
+```javascript
+switch (t) {
+  case V.Zsh:       return new Ae(async function(){ ... });  // LazyExecutor
+  case V.Bash:      /* similar */
+  case V.PowerShell:return new Ae(async function(){ ... });
+  case V.ZshLight:  /* similar */
+  default:          return Te(t);   // Te() creates NaiveTerminalExecutor
+}
+```
+The CLI factory has inline async functions instead of helper calls.
+
+### Shell resolution -- `ce()` (IDE) and `Te()` (CLI)
+
+**IDE** `ce(e)`:
+```javascript
+function ce(e) {
+  const t = "win32" === process.platform;
+  const r = e?.shell ?? (t ? ne() : void 0);   // ne() = PowerShell path
+  const n = process.cwd();
+  return new oe(n, { ...e, shell: r });         // oe = NaiveTerminalExecutor
+}
+```
+Without patching, `e.userTerminalHint` is never consulted, so `r` always resolves to PowerShell on Windows.
+
+**CLI** `Te(e)`:
+```javascript
+function Te(e) {
+  const t = e?.shell ?? Ce();     // Ce() = PowerShell path resolver
+  const n = process.cwd();
+  return new ve(n, { ...e, shell: t });  // ve = NaiveTerminalExecutor
+}
+```
+
+### `getShellExecutablePath` -- `Se()` (IDE only)
+
+```javascript
+function Se(e) {
+  switch (e) {
+    case O.Zsh:
+    case O.ZshLight:  return findActualExecutable("zsh", []).cmd;
+    case O.Bash:      return findActualExecutable("bash", []).cmd;
+    case O.PowerShell:return ne();              // PowerShell path
+    default:          return process.env.SHELL || "/bin/sh";  // broken on Windows
+  }
+}
+```
+The `default` case returns `/bin/sh` on Windows, which doesn't exist. Used by the legacy terminal tool path.
+
+### CLI vs IDE structural differences
+
+1. **`detectShellType` PowerShell arm**: The IDE combines hint-based and system-level PowerShell checks in one `||` chain, making **everything** after it unreachable on Windows. The CLI separates them into distinct arms, so inserting between them is possible and effective.
+
+2. **Executor factory `default` case**: The IDE's `default` calls `ce(e)` which directly creates a `NaiveTerminalExecutor` -- no explicit `case Naive:` is needed. The CLI's `default` calls `Te(t)` which similarly creates one, but the CLI patch adds an explicit `case V.Naive:` to inject `findActualExecutable("nu")` for shell resolution (since the CLI doesn't have a separate `Se()` function).
+
+3. **`getShellExecutablePath` (`Se()`)**: Only exists in the IDE. The CLI resolves the shell path inline in `Te()` and in the patched `case V.Naive:` block.
+
+---
+
 ### What the patcher does
 
 **CLI agent** (3 patches):
@@ -45,6 +182,74 @@ The `NaiveTerminalExecutor` class (spawns `shell -c "command"`) already exists a
 3. **userTerminalHint**: Wires `userTerminalHint` into the shell resolution function (`ce()`) so the IDE's configured shell path (from `terminal.integrated.defaultProfile.windows`) is used by `NaiveTerminalExecutor`
 4. **Shell path fallback**: Adds `case ShellType.Naive:` to `getShellExecutablePath()` (`Se()`) with `findActualExecutable("nu")` and fixes the `default:` case to return PowerShell on Windows instead of `/bin/sh`
 5. Updates the SHA-256 hex hash in `extensionHostProcess.js` and the base64 checksum in `product.json`
+
+### Before and after: `detectShellType` chain
+
+**CLI -- before** (unpatched):
+```javascript
+// hint-based
+  t.includes("zsh")  ? V.Zsh
+: t.includes("bash") && r ? V.Bash
+: t.includes("pwsh") || t.includes("powershell") ? V.PowerShell
+// system-level
+: n ? V.Bash
+: Qe("pwsh") || Qe("powershell") ? V.PowerShell   // always true on Windows
+: Qe("zsh")  ? V.Zsh                                // dead code on Windows
+: Qe("bash") && r ? V.Bash                          // dead code on Windows
+: Qe("pwsh") || Qe("powershell") ? V.PowerShell     // dead code on Windows
+: V.Naive                                            // dead code on Windows
+```
+
+**CLI -- after** (patched, inserted segments marked with `+++`):
+```javascript
+// hint-based
+  t.includes("zsh")  ? V.Zsh
+: t.includes("bash") && r ? V.Bash
+: t.includes("nu") ? V.Naive                        // +++ nu hint detection
+: t.includes("pwsh") || t.includes("powershell") ? V.PowerShell
+// system-level
+: Qe("nu") ? V.Naive                                // +++ nu system detection (before PS)
+: n ? V.Bash
+: Qe("pwsh") || Qe("powershell") ? V.PowerShell
+: Qe("zsh")  ? V.Zsh
+: Qe("bash") && r ? V.Bash
+: Qe("pwsh") || Qe("powershell") ? V.PowerShell
+: V.Naive
+```
+The system `Qe("nu")` is inserted **before** `n ? V.Bash` and the first system PowerShell check, so it's reachable on Windows.
+
+**IDE -- before** (unpatched):
+```javascript
+// hint-based
+  t.includes("zsh")  ? O.Zsh
+: t.includes("bash") && s ? O.Bash
+// combined hint + system (always true on Windows)
+: t.includes("pwsh") || t.includes("powershell")
+  || r && (Ie("pwsh") || Ie("powershell")) ? O.PowerShell
+// everything below is dead code on Windows
+: Ie("zsh")  ? O.Zsh
+: Ie("bash") && s ? O.Bash
+: Ie("pwsh") || Ie("powershell") ? O.PowerShell
+: O.Naive
+```
+
+**IDE -- after** (patched, inserted segments marked with `+++`):
+```javascript
+// hint-based
+  t.includes("zsh")  ? O.Zsh
+: t.includes("bash") && s ? O.Bash
+: t.includes("nu") ? O.Naive                        // +++ nu hint detection
+// combined hint + system (always true on Windows)
+: t.includes("pwsh") || t.includes("powershell")
+  || r && (Ie("pwsh") || Ie("powershell")) ? O.PowerShell
+// system-level (unreachable on Windows -- IDE relies on userTerminalHint instead)
+: Ie("nu") ? O.Naive                                // +++ nu system detection
+: Ie("zsh")  ? O.Zsh
+: Ie("bash") && s ? O.Bash
+: Ie("pwsh") || Ie("powershell") ? O.PowerShell
+: O.Naive
+```
+On the IDE, the system `Ie("nu")` is placed after the combined PowerShell arm. This is unreachable on Windows, but the IDE doesn't need it -- it gets Nushell via `userTerminalHint` (from `terminal.integrated.defaultProfile.windows`) wired into `ce()`.
 
 ### Shell resolution chain (after patching)
 
@@ -174,3 +379,22 @@ The regex-based discovery should handle new minified names automatically. If it 
 - Executor factory: search for `case <enum>.Zsh:` / `case <enum>.Bash:` / `case <enum>.PowerShell:`
 - Shell resolution: search for `?.shell??`
 - `getShellExecutablePath`: search for `process.env.SHELL||"/bin/sh"`
+
+---
+
+## Discovered Variable Names Reference
+
+Last verified against CLI `agent-cli@2026.02.13-41ac335` and IDE `v2.4.37`. The patcher discovers these dynamically via regex, so they don't need to be updated manually -- this table is for debugging and manual inspection.
+
+| Role | CLI name | IDE name |
+|------|----------|----------|
+| `hintVar` (detectShellType arg) | `t` | `t` |
+| `enumVar` (ShellType enum) | `V` | `O` |
+| `LazyExecutor` class | `Ae` | `te` |
+| `NaiveTerminalExecutor` class | `ve` | `oe` |
+| `commandExists` function | `Qe` | `Ie` |
+| `findActualExecutable` call | `(0,r.Ef)` | `(0,s.findActualExecutable)` |
+| `detectShellType` function | `qe` | `Te` |
+| Executor factory function | *(inline switch)* | `be` |
+| Shell resolution (`ce`/`Te`) | `Te` | `ce` |
+| `getShellExecutablePath` | *(none)* | `Se` |
