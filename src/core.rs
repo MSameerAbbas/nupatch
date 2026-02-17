@@ -442,7 +442,9 @@ fn patch_user_terminal_hint<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, s
         );
     }
 
-    let re = lazy_re!(r"(\w+)\?\.shell\?\?(?!\w+\?\.userTerminalHint)");
+    // Use a simple regex without negative lookahead to avoid backtrack-limit
+    // issues on large (4 MB+) minified files.
+    let re = lazy_re!(r"(\w+)\?\.shell\?\?");
     let caps = match re.captures(code).ok().flatten() {
         Some(c) => c,
         None => {
@@ -455,7 +457,14 @@ fn patch_user_terminal_hint<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, s
 
     let shell_var = caps.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
     let find = format!("{shell_var}?.shell??");
-    let replace = format!("{shell_var}?.shell??{shell_var}?.userTerminalHint??");
+    let already_patched = format!("{shell_var}?.shell??{shell_var}?.userTerminalHint??");
+    if code.contains(&already_patched) {
+        return (
+            Cow::Borrowed(code),
+            StepResult::skipped("userTerminalHint", "Already present, skipped"),
+        );
+    }
+    let replace = already_patched;
 
     let new_code = code.replacen(&find, &replace, 1);
     let detail = format!("Find:    {find}\nReplace: {replace}");
@@ -635,29 +644,56 @@ fn patch_shell_path_fallback<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, 
         );
     }
 
-    // Verify this is in getShellExecutablePath (near findActualExecutable and ne())
-    if let Some(idx) = code.find(find) {
-        let region_start = idx.saturating_sub(500);
-        let region = &code[region_start..idx];
-        if !region.contains("findActualExecutable") && !region.contains("PowerShell") {
+    // Discover the PowerShell path resolver function from
+    // `case <enum>.PowerShell:return <fn>()` near the default case.
+    let idx = match code.find(find) {
+        Some(i) => i,
+        None => unreachable!(), // already checked above
+    };
+    let region_start = idx.saturating_sub(500);
+    let region = &code[region_start..idx];
+
+    if !region.contains("findActualExecutable") && !region.contains("PowerShell") {
+        return (
+            Cow::Borrowed(code),
+            StepResult::fail(
+                "Shell path fallback",
+                "Found pattern but not in getShellExecutablePath context",
+            ),
+        );
+    }
+
+    // Extract the PowerShell path resolver function name dynamically
+    // from `case <enum>.PowerShell:return <fn>()`
+    let ps_re = crate::util::re(&format!(
+        r"case {}\.PowerShell:return (\w+)\(\)",
+        v.enum_var,
+    ));
+    let ps_fn = match ps_re.ok().and_then(|r| {
+        r.captures(region).ok().flatten().and_then(|c| {
+            c.get(1).map(|m| m.as_str().to_string())
+        })
+    }) {
+        Some(f) => f,
+        None => {
             return (
                 Cow::Borrowed(code),
                 StepResult::fail(
                     "Shell path fallback",
-                    "Found pattern but not in getShellExecutablePath context",
+                    "Cannot discover PowerShell path resolver function name",
                 ),
             );
         }
-    }
+    };
 
     // Replace with:
     //   case <enum>.Naive: { const _np = findActualExecutable("nu",[]).cmd;
     //                        if (_np !== "nu") return _np }
-    //   default: return process.env.SHELL || ("win32" === process.platform ? ne() : "/bin/sh")
+    //   default: return process.env.SHELL || ("win32" === process.platform ? <ps_fn>() : "/bin/sh")
     let replace = format!(
         "case {ev}.Naive:{{const _np={fex}(\"nu\",[]).cmd;\
          if(_np!==\"nu\")return _np}}\
-         default:return process.env.SHELL||(\"win32\"===process.platform?ne():\"/bin/sh\")",
+         default:return process.env.SHELL||(\"win32\"===process.platform?{ps_fn}():\"/bin/sh\")",
         ev = v.enum_var,
         fex = find_exec,
     );
