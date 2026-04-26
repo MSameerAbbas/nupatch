@@ -166,9 +166,10 @@ fn discover_vars(code: &str) -> Result<DiscoveredVars, String> {
     }
 
     // 4. cmd_exists function + findActualExecutable call pattern
-    //    Pattern: function <name>(<arg>){try{return(0,<mod>.findActualExecutable)(<arg>,[]).cmd!==<arg>}
+    //    Old (wrapped): function <name>(<arg>){try{return(0,<mod>.findActualExecutable)(<arg>,[]).cmd!==<arg>}
+    //    New (bare):    function <name>(<arg>){try{return <fn>(<arg>,[]).cmd!==<arg>}
     let re_cmd = lazy_re!(
-        r"function\s+(\w+)\(\w+\)\{try\{return(\(0,\w+\.\w+\))\(\w+,\[\]\)\.cmd!==\w+\}"
+        r"function\s+(\w+)\(\w+\)\{try\{return\s*(\(0,\w+\.\w+\)|\w+)\(\w+,\[\]\)\.cmd!==\w+\}"
     );
     let (cmd_exists_fn, find_exec_call) = match re_cmd.captures(code).ok().flatten() {
         Some(c) => (
@@ -236,8 +237,9 @@ fn quick_detect(code: &str) -> Option<QuickDetect> {
 
     // System-level nu detection: find cmd_exists function name, then check
     // for the specific NEW position marker: ?<enum>.PowerShell:<fn>("nu")?<enum>.Naive:
+    // Match both wrapped `(0,r.Ef)` and bare `ig` inner-call forms.
     let re_cmd = lazy_re!(
-        r"function\s+(\w+)\(\w+\)\{try\{return\(0,\w+\.\w+\)\(\w+,\[\]\)\.cmd!==\w+\}"
+        r"function\s+(\w+)\(\w+\)\{try\{return\s*(?:\(0,\w+\.\w+\)|\w+)\(\w+,\[\]\)\.cmd!==\w+\}"
     );
     let has_system_nu = re_cmd
         .captures(code)
