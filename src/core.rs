@@ -894,7 +894,7 @@ pub fn check_status(paths: &CursorPaths) -> PatchStatus {
         }
     }
 
-    // Integrity
+    // Integrity (EHP hash only applies when cursor-agent-exec is in the map)
     if let (Some(ide_main), Some(ehp)) = (&paths.ide_main, &paths.ehp)
         && ide_main.is_file() && ehp.is_file()
         && let (Ok(main_hash), Ok(ehp_code)) =

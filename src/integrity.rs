@@ -122,6 +122,9 @@ pub fn update_integrity(
     steps.push(StepResult::ok("Compute hash", format!("main.js SHA-256: {}...", &new_main_hash[..16])));
 
     // Step 2: update hash in extensionHostProcess.js
+    // Cursor >=3.x removed cursor-agent-exec from the EHP hash map, so
+    // neither the regex nor the backup fallback will find anything -- that's
+    // fine, we just skip.
     if !dry_run {
         if let Err(e) = backup(ehp) {
             return fail(vec![StepResult::fail("EHP backup", format!("Failed to backup EHP: {e}"))]);
@@ -142,36 +145,27 @@ pub fn update_integrity(
         r#"(cursor-agent-exec[^}]*dist:\{[^}]*"main\.js":")([a-f0-9]{64})(")"#
     );
 
-    if let Some(caps) = hash_re.captures(&ehp_code).ok().flatten() {
+    let ehp_modified = if let Some(caps) = hash_re.captures(&ehp_code).ok().flatten() {
         let old_hash = caps.get(2).unwrap().as_str();
         ehp_code = ehp_code.replacen(old_hash, &new_main_hash, 1);
         steps.push(StepResult::ok("EHP hash", "Replaced hash in extensionHostProcess.js"));
+        true
     } else {
-        // Fallback: compute old hash from backup
         let bak = bak_path(ide_main);
-        if bak.exists() {
-            let old_hash = match sha256_hex(&bak) {
-                Ok(h) => h,
-                Err(e) => {
-                    steps.push(StepResult::fail("EHP hash", format!("Failed to hash backup: {e}")));
-                    return fail(steps);
-                }
-            };
-            let count = ehp_code.matches(&old_hash).count();
-            if count == 1 {
-                ehp_code = ehp_code.replacen(&old_hash, &new_main_hash, 1);
-                steps.push(StepResult::ok("EHP hash", "Replaced hash via backup comparison"));
-            } else {
-                steps.push(StepResult::fail("EHP hash", format!("Old hash found {count} time(s) (expected 1)")));
-                return fail(steps);
-            }
+        let old_hash = bak.exists().then(|| sha256_hex(&bak)).and_then(Result::ok);
+        if let Some(ref h) = old_hash
+            && ehp_code.matches(h.as_str()).count() == 1
+        {
+            ehp_code = ehp_code.replacen(h.as_str(), &new_main_hash, 1);
+            steps.push(StepResult::ok("EHP hash", "Replaced hash via backup comparison"));
+            true
         } else {
-            steps.push(StepResult::fail("EHP hash", "Cannot find hash map pattern or backup file"));
-            return fail(steps);
+            steps.push(StepResult::skipped("EHP hash", "No cursor-agent-exec hash in EHP, skipped"));
+            false
         }
-    }
+    };
 
-    if !dry_run
+    if ehp_modified && !dry_run
         && let Err(e) = fs::write(ehp, &ehp_code)
     {
         steps.push(StepResult::fail("EHP write", format!("Failed to write EHP: {e}")));
