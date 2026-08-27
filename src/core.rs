@@ -112,6 +112,8 @@ struct DiscoveredVars {
     /// System-level `<cmdExists>("nu")` check in detectShellType.
     has_system_nu: bool,
     has_user_terminal_hint: bool,
+    /// Naive spawn prepends `-l` when the shell binary is nu.
+    has_nu_login: bool,
 }
 
 /// Discover minified variable names from structural patterns.
@@ -201,6 +203,7 @@ fn discover_vars(code: &str) -> Result<DiscoveredVars, String> {
     // usage in the switch(Te(e?.userTerminalHint...)) statement.
     let re_uth = lazy_re!(r"\.shell\?\?\w+\?\.userTerminalHint\?\?");
     let has_user_terminal_hint = re_uth.is_match(code).unwrap_or(false);
+    let has_nu_login = code.contains(NU_LOGIN_MARKER);
 
     Ok(DiscoveredVars {
         hint_var,
@@ -213,6 +216,7 @@ fn discover_vars(code: &str) -> Result<DiscoveredVars, String> {
         has_nu_detection,
         has_system_nu,
         has_user_terminal_hint,
+        has_nu_login,
     })
 }
 
@@ -222,6 +226,7 @@ struct QuickDetect {
     has_system_nu: bool,
     has_naive_case: bool,
     has_uth: bool,
+    has_nu_login: bool,
 }
 
 fn quick_detect(code: &str) -> Option<QuickDetect> {
@@ -259,6 +264,7 @@ fn quick_detect(code: &str) -> Option<QuickDetect> {
         has_system_nu,
         has_naive_case,
         has_uth,
+        has_nu_login: code.contains(NU_LOGIN_MARKER),
     })
 }
 
@@ -474,6 +480,44 @@ fn patch_user_terminal_hint<'a>(code: &'a str, v: &DiscoveredVars) -> (Cow<'a, s
     (
         Cow::Owned(new_code),
         StepResult::ok("userTerminalHint", format!("{find} -> {replace}")).with_detail(detail),
+    )
+}
+
+// ---------------------------------------------------------------------------
+//  Patch: nu login flag (`-l`) on Naive spawn (CLI + IDE)
+// ---------------------------------------------------------------------------
+
+/// NaiveTerminalExecutor already does `spawn(shell, [...shellArgs, "-c", cmd])`.
+/// When that shell is nu, prepend `-l` so the agent gets `nu -l -c` and loads
+/// env.nu/config.nu. Other Naive binaries are left as `shell -c`.
+const NAIVE_SPAWN_ARGS: &str = r#"[...this.options?.shellArgs??[],"-c","#;
+const NAIVE_SPAWN_ARGS_PATCHED: &str = concat!(
+    r#"[...this.options?.shellArgs??[],.../(?:^|[\\/])nu(?:\.exe)?$/i.test("#,
+    r#"this.options?.shell||process.env.SHELL||"/bin/sh")?["-l"]:[],"-c","#,
+);
+const NU_LOGIN_MARKER: &str = r#"/(?:^|[\\/])nu(?:\.exe)?$/i.test(this.options?.shell"#;
+
+fn patch_nu_login<'a>(code: &'a str, _v: &DiscoveredVars) -> (Cow<'a, str>, StepResult) {
+    if code.contains(NU_LOGIN_MARKER) {
+        return (
+            Cow::Borrowed(code),
+            StepResult::skipped("Nu login", "Already present, skipped"),
+        );
+    }
+
+    if !code.contains(NAIVE_SPAWN_ARGS) {
+        return (
+            Cow::Borrowed(code),
+            StepResult::fail("Nu login", "Cannot find Naive spawn `[...shellArgs,\"-c\"]`"),
+        );
+    }
+
+    let new_code = code.replacen(NAIVE_SPAWN_ARGS, NAIVE_SPAWN_ARGS_PATCHED, 1);
+    let detail = format!("Find:    {NAIVE_SPAWN_ARGS}\nReplace: {NAIVE_SPAWN_ARGS_PATCHED}");
+
+    (
+        Cow::Owned(new_code),
+        StepResult::ok("Nu login", "Naive spawn prepends -l when shell is nu").with_detail(detail),
     )
 }
 
@@ -777,10 +821,10 @@ fn run_patch(path: &Path, dry_run: bool, plan: &PatchPlan) -> PatchResult {
     steps.push(StepResult::ok("Pattern discovery", "Discovered minified variable names")
         .with_detail(format!(
             "hint_var={}  enum_var={}  lazy_exec={:?}  naive_exec={:?}  \
-             cmd_exists={:?}  find_exec={:?}  has_uth={}  has_sys_nu={}",
+             cmd_exists={:?}  find_exec={:?}  has_uth={}  has_sys_nu={}  has_nu_login={}",
             v.hint_var, v.enum_var, v.lazy_exec, v.naive_exec,
             v.cmd_exists_fn, v.find_exec_call,
-            v.has_user_terminal_hint, v.has_system_nu,
+            v.has_user_terminal_hint, v.has_system_nu, v.has_nu_login,
         )));
 
     // Apply each patch in order.
@@ -821,8 +865,9 @@ const CLI_PLAN: PatchPlan = PatchPlan {
         ("Nu detection", patch_nu_detection),
         ("System nu detection", patch_system_nu_detection),
         ("Naive case", patch_naive_case),
+        ("Nu login", patch_nu_login),
     ],
-    is_fully_patched: |d| d.has_nu && d.has_system_nu && d.has_naive_case,
+    is_fully_patched: |d| d.has_nu && d.has_system_nu && d.has_naive_case && d.has_nu_login,
     restore_before_patch: true,
 };
 
@@ -842,8 +887,9 @@ const IDE_PLAN: PatchPlan = PatchPlan {
         ("System nu detection", patch_system_nu_detection),
         ("userTerminalHint", patch_user_terminal_hint),
         ("Shell path fallback", patch_shell_path_fallback),
+        ("Nu login", patch_nu_login),
     ],
-    is_fully_patched: |d| d.has_nu && d.has_system_nu && d.has_uth,
+    is_fully_patched: |d| d.has_nu && d.has_system_nu && d.has_uth && d.has_nu_login,
     restore_before_patch: true,
 };
 
@@ -874,6 +920,7 @@ pub fn check_status(paths: &CursorPaths) -> PatchStatus {
             status.cli.patches.insert("Nu detection".into(), det.has_nu);
             status.cli.patches.insert("System nu detection".into(), det.has_system_nu);
             status.cli.patches.insert("Naive case".into(), det.has_naive_case);
+            status.cli.patches.insert("Nu login".into(), det.has_nu_login);
         }
     }
 
@@ -891,6 +938,7 @@ pub fn check_status(paths: &CursorPaths) -> PatchStatus {
             status.ide.patches.insert("Nu detection".into(), det.has_nu);
             status.ide.patches.insert("System nu detection".into(), det.has_system_nu);
             status.ide.patches.insert("userTerminalHint".into(), det.has_uth);
+            status.ide.patches.insert("Nu login".into(), det.has_nu_login);
         }
     }
 
