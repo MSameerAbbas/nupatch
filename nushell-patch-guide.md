@@ -1,421 +1,366 @@
-# Cursor Nushell Patch Guide (Personal Reference)
+# Cursor Nushell Patch Guide
 
-Local patches to make Cursor's CLI and IDE agents use Nushell instead of PowerShell on Windows.
+How and why `nupatch` makes Cursor's CLI and IDE agents run [Nushell](https://www.nushell.sh/)
+instead of PowerShell on Windows.
 
-First verified on: CLI v2026.02.13-41ac335, IDE v2.4.37
-Last verified on: CLI v2026.02.27-e7d2ef6, IDE v2.5.26
+This document is self-contained: read it top to bottom and you'll understand the
+problem, how Cursor's shell layer works, exactly what each patch changes, and the
+two subtle traps that make a naive patch fail. No need to reverse-engineer the
+minified code yourself.
 
----
-
-## Quick Start
-
-```
-nupatch patch                  # patch both CLI + IDE
-nupatch patch --dry-run        # show what would change
-nupatch status                 # check current patch state
-nupatch revert                 # restore all from backups
-```
-
-Then:
-- **CLI**: Nushell auto-detected from PATH -- no `$env:SHELL` needed
-- **IDE**: Full quit + relaunch Cursor (not just Reload Window)
+Verified against **CLI `v2026.08.25-3e8eec8`** and **IDE `v2.5.26`**. Cursor ships
+this code heavily minified, and the identifier names change between releases, so
+throughout this guide we use *role names* (e.g. `detectShellType`, `NaiveExecutor`)
+rather than the minified letters. `nupatch` recovers the real names automatically
+(see [How nupatch finds the code](#6-how-nupatch-finds-the-code)).
 
 ---
 
-## Overview
+## 1. The problem
 
-Cursor's agents use a shared shell execution library with several bugs:
+Cursor runs agent shell commands through a small shell-execution library. On
+Windows that library has four bugs that together make Nushell impossible to use,
+even though Cursor already contains everything needed to run it:
 
-1. **No nushell detection in `detectShellType()`**: No `includes("nu")` check. On Windows, the system-level PowerShell check (`commandExists("pwsh") || commandExists("powershell")`) always fires `true` since PowerShell is always installed, making everything after it unreachable dead code. Any nushell check placed after this point will never execute.
-2. **No `userTerminalHint` in shell resolution**: The shell resolution function (`Ue()` in the IDE, `Se()` in the CLI) doesn't check `userTerminalHint`, so even when detection works, the shell path used is still PowerShell (from a hardcoded Windows resolver `Pe()`/`Ce()`)
-3. **`getShellExecutablePath` returns `/bin/sh` on Windows**: The `ot()` function's `default:` case returns `/bin/sh` for `ShellType.Naive`, which doesn't exist on Windows. This breaks the legacy terminal tool path.
-4. **No PATH-based nushell detection**: The system-level fallback in `detectShellType()` only checks for `pwsh`/`powershell`/`zsh`/`bash` -- never `nu`.
+1. **No nushell in shell detection.** The function that maps a shell hint to a
+   shell type has no `nu` case, so Nushell is never recognized.
+2. **The system fallback never reaches nushell.** Detection ends with system
+   probes like `commandExists("pwsh")`. PowerShell is *always* installed on
+   Windows, so that probe always returns true — every branch after it is dead
+   code. Any `nu` check placed after it can never run.
+3. **The shell path always resolves to PowerShell.** When Cursor builds the
+   fallback executor it ignores the user's configured terminal
+   (`userTerminalHint`) and hard-codes the Windows PowerShell path.
+4. **`getShellExecutablePath` returns `/bin/sh` on Windows.** Its default case
+   returns a path that doesn't exist on Windows, breaking the legacy terminal
+   tool for any unrecognized shell.
 
-The `NaiveTerminalExecutor` class (spawns `shell -c "command"`) already exists and works with nushell. It just needs to be routed to with the correct shell path.
-
-## Minified Code Structure
-
-> Last verified: CLI `v2026.02.27-e7d2ef6`, IDE `v2.5.26`.
-> Minified names change across versions, but the structure is stable.
-
-### `detectShellType` -- the core routing decision
-
-Both CLI and IDE now have the same structure: hint-based string checks and system-level `commandExists` checks are **separate** arms. (Prior to IDE v2.5.26, the IDE combined hint + system PowerShell checks in one `||` chain, making everything after it unreachable on Windows. That was fixed upstream.)
-
-**CLI** (`Ge(e)`):
-```javascript
-function Ge(e) {
-  if (e === W.ZshLight) return W.ZshLight;
-  const t = e || process.env.SHELL || "";
-  const n = e ? void 0 : qe();                    // MSYSTEM git-bash check
-  const r = void 0 !== n || /git.*bash\.exe$/i.test(t) || ...;
-
-  // --- hint-based checks (from userTerminalHint / $env.SHELL) ---
-  return t.includes("zsh")  ? W.Zsh
-       : t.includes("bash") && r ? W.Bash
-       : t.includes("pwsh") || t.includes("powershell") ? W.PowerShell
-  // --- system-level checks (commandExists probes) ---
-       : n ? W.Bash                                      // MSYSTEM bash
-       : Ue("pwsh") || Ue("powershell") ? W.PowerShell   // <-- always true on Windows
-       : Ue("zsh")  ? W.Zsh
-       : Ue("bash") && r ? W.Bash
-       : Ue("pwsh") || Ue("powershell") ? W.PowerShell   // redundant duplicate
-       : W.Naive;
-}
-```
-
-**IDE** (`ut(e)`):
-```javascript
-function ut(e) {
-  if (e === ne.ZshLight) return ne.ZshLight;
-  const t = e || process.env.SHELL || "";
-  const n = "win32" === process.platform;
-  const r = n && !e ? lt() : void 0;              // MSYSTEM check (Windows + no hint only)
-  const s = void 0 !== r || /git.*bash\.exe$/i.test(t) || ...;
-  const i = !n || s;
-
-  // --- hint-based checks ---
-  return t.includes("zsh")  ? ne.Zsh
-       : t.includes("bash") && i ? ne.Bash
-       : t.includes("pwsh") || t.includes("powershell") ? ne.PowerShell
-  // --- system-level checks ---
-       : r ? ne.Bash                                           // MSYSTEM bash
-       : n && (ct("pwsh") || ct("powershell")) ? ne.PowerShell // <-- always true on Windows
-       : ct("zsh")  ? ne.Zsh
-       : ct("bash") && i ? ne.Bash
-       : ct("pwsh") || ct("powershell") ? ne.PowerShell
-       : ne.Naive;
-}
-```
-
-Key: in both agents, the system-level PowerShell check always fires on Windows, making everything below it **dead code on Windows**.
-
-### `commandExists` -- PATH probe
-
-```javascript
-// CLI: Ue(e)          IDE: ct(e)
-function commandExists(e) {
-  try { return findActualExecutable(e, []).cmd !== e; }
-  catch(e) { return false; }
-}
-```
-Returns `true` if the binary resolves to a real path (i.e. is on PATH).
-
-### Executor factory -- how `ShellType` maps to an executor
-
-Both agents now wire `userTerminalHint` into `detectShellType` before the switch. If `userTerminalHint` is not provided, they fall back to the MSYSTEM check (`lt()`/`qe()`). The hint is then passed to `detectShellType` to determine which executor to create.
-
-**IDE** (`dt(e)`):
-```javascript
-function dt(e) {
-  let t = e;
-  if (!e?.userTerminalHint) {
-    const n = lt();                                // MSYSTEM fallback
-    n && (t = { ...e, userTerminalHint: n });
-  }
-  switch (ut(t?.userTerminalHint ?? "")) {         // detectShellType(hint)
-    case ne.Zsh:       return new Qe(We(t));       // LazyExecutor(zsh setup)
-    case ne.Bash:      return new Qe(xe(t));       // LazyExecutor(bash setup)
-    case ne.PowerShell:return new Qe(Me());        // LazyExecutor(pwsh setup)
-    case ne.ZshLight:  return new Qe(et(t));       // LazyExecutor(zsh-light setup)
-    default:           return Ue(t);               // NaiveTerminalExecutor directly
-  }
-}
-```
-
-**CLI** (`He(e)`):
-```javascript
-function He(e) {
-  let t = e;
-  if (!e?.userTerminalHint) {
-    const n = qe();                                // MSYSTEM fallback
-    n && (t = { ...e, userTerminalHint: n });
-  }
-  switch (Ge(t?.userTerminalHint ?? "")) {         // detectShellType(hint)
-    case W.Zsh:       return new Ae(async function(){ ... });  // LazyExecutor
-    case W.Bash:      /* similar */
-    case W.PowerShell:return new Ae(async function(){ ... });
-    case W.ZshLight:  /* similar */
-    default:          return Se(t);                // Se() creates NaiveTerminalExecutor
-  }
-}
-```
-
-No `case Naive:` is needed in either factory because `default` already routes there. The CLI patch adds an explicit `case W.Naive:` to inject `findActualExecutable("nu")` for shell resolution (since the CLI doesn't have a separate `getShellExecutablePath`).
-
-### Shell resolution -- `Ue()` (IDE) and `Se()` (CLI)
-
-**IDE** `Ue(e)`:
-```javascript
-function Ue(e) {
-  const t = "win32" === process.platform;
-  const n = e?.shell ?? (t ? Pe() : void 0);   // Pe() = PowerShell path
-  const r = process.cwd();
-  return new Oe(r, { ...e, shell: n });         // Oe = NaiveTerminalExecutor
-}
-```
-Without patching, `e.userTerminalHint` is never consulted, so `n` always resolves to PowerShell on Windows.
-
-**CLI** `Se(e)`:
-```javascript
-function Se(e) {
-  const t = e?.shell ?? Ce();     // Ce() = PowerShell path resolver
-  const n = process.cwd();
-  return new ve(n, { ...e, shell: t });  // ve = NaiveTerminalExecutor
-}
-```
-
-### `getShellExecutablePath` -- `ot()` (IDE only)
-
-```javascript
-function ot(e) {
-  switch (e) {
-    case ne.Zsh:
-    case ne.ZshLight:  return findActualExecutable("zsh", []).cmd;
-    case ne.Bash:      return findActualExecutable("bash", []).cmd;
-    case ne.PowerShell:return Pe();              // PowerShell path
-    default:           return process.env.SHELL || "/bin/sh";  // broken on Windows
-  }
-}
-```
-The `default` case returns `/bin/sh` on Windows, which doesn't exist. Used by the legacy terminal tool path.
-
-### CLI vs IDE structural differences
-
-1. **`detectShellType` structure**: Both agents now have the same structure -- hint-based and system-level checks are separate arms. (Prior to IDE v2.5.26, the IDE combined them in one `||` chain, making everything after the PowerShell arm unreachable on Windows.)
-
-2. **Executor factory `userTerminalHint`**: Both agents now wire `userTerminalHint` into `detectShellType` before the switch. This means `includes("nu")` can fire when the user's configured terminal profile contains "nu". However, the shell resolution functions (`Ue()`/`Se()`) still don't use `userTerminalHint`, so the NaiveTerminalExecutor would still get PowerShell without patching.
-
-3. **`getShellExecutablePath` (`ot()`)**: Only exists in the IDE. The CLI resolves the shell path inline in `Se()` and in the patched `case W.Naive:` block.
+The good news: Cursor already has a `NaiveExecutor` that simply spawns
+`shell -c "command"`, and it works perfectly with Nushell. The whole job is to
+(a) make detection route to it and (b) make the shell path resolve to `nu`.
 
 ---
 
-### What the patcher does
+## 2. How Cursor decides which shell to run
 
-**CLI agent** (3 patches):
-1. **Nu detection**: Adds `includes("nu")?ShellType.Naive:` **before** the PowerShell condition in `detectShellType()` so nushell is recognized from hints (placement is critical -- after the PowerShell check is unreachable on Windows)
-2. **System nu detection**: Adds `commandExists("nu")?ShellType.Naive:` right after the first (hint-based) `?PowerShell:` arm in `detectShellType()`, placing it before the system-level PowerShell checks so it's reachable on Windows where PowerShell is always installed
-3. **Naive case**: Adds `case ShellType.Naive:` in the executor factory with `findActualExecutable("nu")` PATH-based shell resolution (no `$env:SHELL` required)
+The pipeline, from a command to a spawned process:
 
-**IDE agent** (4 patches + integrity chain):
-1. **Nu detection**: Same `includes("nu")` detection before the PowerShell condition
-2. **System nu detection**: Same `commandExists("nu")` PATH-based check, placed after the hint-based PowerShell arm and before the system-level PowerShell checks -- reachable on Windows
-3. **userTerminalHint**: Wires `userTerminalHint` into the shell resolution function (`Ue()`) so the IDE's configured shell path (from `terminal.integrated.defaultProfile.windows`) is used by `NaiveTerminalExecutor`
-4. **Shell path fallback**: Adds `case ShellType.Naive:` to `getShellExecutablePath()` (`ot()`) with `findActualExecutable("nu")` and fixes the `default:` case to return PowerShell on Windows instead of `/bin/sh`
-5. Updates the SHA-256 hex hash in `extensionHostProcess.js` and the base64 checksum in `product.json`
+```
+detectShellType(hint) ──▶ ShellType ──▶ executor factory ──▶ an executor ──▶ spawn(shell, [...args, "-c", cmd])
+```
 
-### Before and after: `detectShellType` chain
+### `detectShellType(hint) -> ShellType`
 
-**CLI -- before** (unpatched):
+Returns a `ShellType` enum value (`Zsh`, `Bash`, `PowerShell`, `Naive`, …). It
+checks the hint string first, then falls back to system PATH probes:
+
 ```javascript
-// hint-based
-  t.includes("zsh")  ? W.Zsh
-: t.includes("bash") && r ? W.Bash
-: t.includes("pwsh") || t.includes("powershell") ? W.PowerShell
-// system-level
-: n ? W.Bash
-: Ue("pwsh") || Ue("powershell") ? W.PowerShell   // always true on Windows
-: Ue("zsh")  ? W.Zsh                                // dead code on Windows
-: Ue("bash") && r ? W.Bash                          // dead code on Windows
-: Ue("pwsh") || Ue("powershell") ? W.PowerShell     // dead code on Windows
-: W.Naive                                            // dead code on Windows
+// hint-based checks (from userTerminalHint or $env.SHELL)
+  hint.includes("zsh")                          ? ShellType.Zsh
+: hint.includes("bash") && isBashOk             ? ShellType.Bash
+: hint.includes("pwsh")||hint.includes("powershell") ? ShellType.PowerShell
+// system-level checks (probe the PATH)
+: commandExists("pwsh")||commandExists("powershell") ? ShellType.PowerShell  // ← always true on Windows
+: commandExists("zsh")                          ? ShellType.Zsh              // dead code on Windows
+: … : ShellType.Naive
 ```
 
-**CLI -- after** (patched, inserted segments marked with `+++`):
+The marked line is the crux of bug #2: on Windows everything below it is
+unreachable.
+
+### `commandExists(name) -> bool`
+
+A PATH probe: `findActualExecutable(name, []).cmd !== name`. It returns true when
+`name` resolves to a real binary on PATH. (`findActualExecutable` returns the
+input unchanged when it finds nothing, so `cmd !== name` means "found".)
+
+### The executor factory
+
+Wires `userTerminalHint` into detection, then switches on the result:
+
 ```javascript
-// hint-based
-  t.includes("zsh")  ? W.Zsh
-: t.includes("bash") && r ? W.Bash
-: t.includes("nu") ? W.Naive                        // +++ nu hint detection
-: t.includes("pwsh") || t.includes("powershell") ? W.PowerShell
-// system-level
-: Ue("nu") ? W.Naive                                // +++ nu system detection (before PS)
-: n ? W.Bash
-: Ue("pwsh") || Ue("powershell") ? W.PowerShell
-: Ue("zsh")  ? W.Zsh
-: Ue("bash") && r ? W.Bash
-: Ue("pwsh") || Ue("powershell") ? W.PowerShell
-: W.Naive
+switch (detectShellType(opts?.userTerminalHint ?? "")) {
+  case ShellType.Zsh:        return new LazyExecutor(zshSetup(opts));   // env "state dump"
+  case ShellType.Bash:       return new LazyExecutor(bashSetup(opts));
+  case ShellType.PowerShell: return new LazyExecutor(pwshSetup());
+  case ShellType.ZshLight:   return new LazyExecutor(zshLightSetup(opts));
+  default:                   return createNaiveExecutor(opts);         // ← Naive lives here
+}
 ```
-The system `Ue("nu")` is inserted **before** `n ? W.Bash` and the first system PowerShell check, so it's reachable on Windows.
 
-**IDE -- before** (unpatched):
+The zsh/bash/pwsh cases build a `LazyExecutor` that first runs a big script to
+capture the shell's environment (this is the slow "warm-up" you see at startup).
+The `default` case just makes a `NaiveExecutor` — no warm-up. **Nushell rides the
+`default`/Naive path**, which is why it starts instantly.
+
+### `createNaiveExecutor(opts)` — the shell resolver
+
+Builds the `NaiveExecutor` and chooses its shell path:
+
 ```javascript
-// hint-based
-  t.includes("zsh")  ? ne.Zsh
-: t.includes("bash") && i ? ne.Bash
-: t.includes("pwsh") || t.includes("powershell") ? ne.PowerShell
-// system-level
-: r ? ne.Bash                                           // MSYSTEM bash
-: n && (ct("pwsh") || ct("powershell")) ? ne.PowerShell // always true on Windows
-: ct("zsh")  ? ne.Zsh                                   // dead code on Windows
-: ct("bash") && i ? ne.Bash                              // dead code on Windows
-: ct("pwsh") || ct("powershell") ? ne.PowerShell         // dead code on Windows
-: ne.Naive                                               // dead code on Windows
+function createNaiveExecutor(opts) {
+  const shell = opts?.shell ?? powerShellPath();   // ← ignores userTerminalHint → always pwsh on Windows
+  return new NaiveExecutor(process.cwd(), { ...opts, shell });
+}
 ```
 
-**IDE -- after** (patched, inserted segments marked with `+++`):
+This is bug #3: `userTerminalHint` is never consulted, so the shell is PowerShell.
+
+### `getShellExecutablePath(type) -> string`
+
+A separate resolver used by the *legacy* terminal tool. **Both** the CLI and IDE
+now ship this function:
+
 ```javascript
-// hint-based
-  t.includes("zsh")  ? ne.Zsh
-: t.includes("bash") && i ? ne.Bash
-: t.includes("nu") ? ne.Naive                        // +++ nu hint detection
-: t.includes("pwsh") || t.includes("powershell") ? ne.PowerShell
-// system-level
-: ct("nu") ? ne.Naive                                // +++ nu system detection (before PS)
-: r ? ne.Bash
-: n && (ct("pwsh") || ct("powershell")) ? ne.PowerShell
-: ct("zsh")  ? ne.Zsh
-: ct("bash") && i ? ne.Bash
-: ct("pwsh") || ct("powershell") ? ne.PowerShell
-: ne.Naive
-```
-The system `ct("nu")` is inserted **before** `r ? ne.Bash` and the system PowerShell check, so it's reachable on Windows. (In previous IDE versions, the combined PowerShell arm made this position unreachable -- the IDE relied solely on `userTerminalHint` for Windows nushell detection.)
-
-### Shell resolution chain (after patching)
-
-**CLI Naive case**:
-```
-userTerminalHint → findActualExecutable("nu") → process.env.SHELL → "/bin/sh"
+function getShellExecutablePath(type) {
+  switch (type) {
+    case ShellType.Zsh:
+    case ShellType.ZshLight:  return findActualExecutable("zsh", []).cmd;
+    case ShellType.Bash:      return findActualExecutable("bash", []).cmd;
+    case ShellType.PowerShell:return powerShellPath();
+    default:                  return process.env.SHELL || "/bin/sh";   // ← bug #4: "/bin/sh" on Windows
+  }
+}
 ```
 
-**IDE non-legacy path** (`Ue()`):
-```
-opts.shell → opts.userTerminalHint → platform default (PowerShell on Windows)
+### The spawn
+
+The `NaiveExecutor` finally spawns:
+
+```javascript
+spawn(this.options?.shell || process.env.SHELL || "/bin/sh",
+      [...this.options?.shellArgs ?? [], "-c", command], …)
 ```
 
-**IDE legacy path** (`ot(ne.Naive)`):
+So if `options.shell` is `nu`, this runs `nu -c "command"` — exactly what we want.
+
+---
+
+## 3. The patches
+
+Five patches per agent. Each is a small, targeted string insertion; `nupatch`
+applies them to a pristine copy (it restores from backup first, so re-running is
+idempotent).
+
+| # | Patch | CLI | IDE | What it does |
+|---|-------|:---:|:---:|--------------|
+| 1 | Nu detection (hint) | ✅ | ✅ | Recognize `nu` from the hint |
+| 2 | Nu detection (system) | ✅ | ✅ | Recognize `nu` from PATH, reachably |
+| 3 | Naive factory case | ✅ | — | Resolve shell to `nu` in the executor factory |
+| 3′ | userTerminalHint | — | ✅ | Make the shell resolver honor the configured terminal |
+| 4 | Shell-path fallback | ✅ | ✅ | Fix `getShellExecutablePath` for Naive + Windows |
+| 5 | Nu login flag | ✅ | ✅ | Spawn `nu -l -c` so `env.nu`/`config.nu` load |
+
+### Patch 1 — hint-level nu detection
+
+Insert a `nu` arm **before** the PowerShell hint arm (placement matters: after it
+is unreachable on Windows):
+
+```javascript
+: hint.includes("bash") && isBashOk ? ShellType.Bash
+: hint.includes("nu") ? ShellType.Naive                        // +++ inserted
+: hint.includes("pwsh")||hint.includes("powershell") ? ShellType.PowerShell
 ```
-findActualExecutable("nu") → process.env.SHELL → PowerShell on Windows / "/bin/sh" on *nix
+
+### Patch 2 — system-level nu detection
+
+Insert a `commandExists("nu")` arm right after the *first* (hint-based)
+`? ShellType.PowerShell :`, which places it **before** the always-true system
+PowerShell probe, keeping it reachable on Windows:
+
+```javascript
+: hint.includes("pwsh")||hint.includes("powershell") ? ShellType.PowerShell
+: commandExists("nu") ? ShellType.Naive                        // +++ inserted (reachable)
+: commandExists("pwsh")||commandExists("powershell") ? ShellType.PowerShell
+```
+
+With patches 1–2, `detectShellType("")` returns `Naive` whenever `nu` is on PATH.
+
+### Patch 3 — Naive case in the executor factory (CLI only)
+
+Add an explicit `case ShellType.Naive:` that resolves the shell to `nu`:
+
+```javascript
+case ShellType.Naive: {
+  const found = findActualExecutable("nu", []).cmd;            // real nu path, or "nu" if not found
+  return new NaiveExecutor(process.cwd(), {
+    ...opts,
+    shell: opts?.userTerminalHint
+        || (found !== "nu" ? found : undefined)                // discovered nu path
+        || opts?.shell || process.env.SHELL || "/bin/sh",
+  });
+}
+```
+
+Priority: the user's configured terminal, then an auto-discovered `nu`, then
+existing fallbacks. See [Trap A and Trap B](#4-two-traps) for why this exact shape
+matters.
+
+### Patch 3′ — userTerminalHint in the shell resolver (IDE only)
+
+The IDE reaches the Naive path through `createNaiveExecutor`, so instead of a
+factory case we make that resolver honor the configured terminal — add a
+`userTerminalHint` fallback to the shell selection:
+
+```javascript
+const shell = opts?.shell ?? opts?.userTerminalHint ?? powerShellPath();   // +++ userTerminalHint added
+```
+
+Now the IDE uses the shell from `terminal.integrated.defaultProfile.windows`.
+
+### Patch 4 — shell-path fallback (both agents)
+
+Fix `getShellExecutablePath` so the Naive/legacy path resolves `nu` and never
+returns `/bin/sh` on Windows:
+
+```javascript
+case ShellType.Naive: {                                        // +++ inserted
+  const found = findActualExecutable("nu", []).cmd;
+  if (found !== "nu") return found;
+}
+default: return process.env.SHELL
+      || ("win32" === process.platform ? powerShellPath() : "/bin/sh");   // +++ Windows-safe
+```
+
+### Patch 5 — nu login flag
+
+The `NaiveExecutor` spawns `shell [...args] -c cmd`. When the shell is `nu`,
+prepend `-l` so login files (`env.nu`, `config.nu`) load; other shells are
+untouched:
+
+```javascript
+[...this.options?.shellArgs ?? [],
+ .../(?:^|[\\/])nu(?:\.exe)?$/i.test(this.options?.shell || process.env.SHELL || "/bin/sh") ? ["-l"] : [],
+ "-c", command]
 ```
 
 ---
 
-## The Automated Patcher
+## 4. Two traps
 
-`nupatch` (Rust) uses **regex-based pattern discovery** to find the minified variable names dynamically. It doesn't hardcode version-specific names like `qe`, `Ge`, `ve` etc. Instead it finds them by matching structural patterns that are stable across versions:
+These are the mistakes a hand-written patch (or an LLM) will make. Both are
+already handled by `nupatch`; they're documented so nobody reintroduces them.
 
-- `<hint>.includes("zsh")?<enum>.Zsh` — discovers `hintVar` and `enumVar`
-- `case <enum>.Zsh:...new <LazyExec>(` — discovers `LazyExecutor`
-- `new <NaiveExec>(<cwd>, {..., shell:})` — discovers `NaiveTerminalExecutor`
-- `function <func>(<arg>){try{return(0,<mod>.findActualExecutable)(<arg>,[]).cmd!==<arg>}` — discovers `cmdExists` function name and `findActualExecutable` call pattern
-- `<hint>.includes("pwsh")` — discovers the nu-detection insertion point (must be before this)
-- `?<enum>.PowerShell:` (first occurrence in detectShellType) — discovers the system detection insertion point (insert right after it, before the system-level PowerShell checks)
-- `<var>?.shell??` — discovers the shell resolution insertion point for `userTerminalHint`
-- `default:return process.env.SHELL||"/bin/sh"` — discovers the `getShellExecutablePath` fallback to patch
+### Trap A — anchor the factory case on the right `switch`
 
-### Commands
+Current builds contain **two** `case ShellType.Zsh:` blocks: one inside
+`getShellExecutablePath`, and one inside the executor factory. If Patch 3 anchors
+on "the first `case Zsh:`", it lands in `getShellExecutablePath` and the factory
+never gets a Naive case — the shell silently resolves wrong.
 
-```
-nupatch patch                  # patch both CLI + IDE
-nupatch patch --cli-only       # patch CLI only
-nupatch patch --ide-only       # patch IDE only
-nupatch patch --dry-run        # show what would change
-nupatch revert                 # restore all from backups
-nupatch status                 # check current patch state
-```
+Fix: anchor on the factory's `switch(detectShellType(opts?.userTerminalHint …))`
+statement, then find `case Zsh:` *after* that point.
 
-### After patching
+### Trap B — build the Naive executor exactly like the original
 
-- **CLI**: `nu` must be on PATH. No `$env:SHELL` needed — `detectShellType` checks `commandExists("nu")` before the system-level PowerShell checks, and the Naive case uses `findActualExecutable("nu")` for shell path resolution.
-- **IDE**: Full quit + relaunch (check system tray for lingering Cursor processes)
-- **IDE settings**: Set `terminal.integrated.defaultProfile.windows` to your Nushell profile. Use literal paths (not `${env:USERPROFILE}`) to avoid VS Code variable resolution issues.
+Two details in Patch 3 are load-bearing:
+
+1. **Spread order.** Write `{ ...opts, shell }` — spread first, `shell` last — so
+   the resolved shell wins. `{ shell, ...opts }` lets a stray `shell` key in
+   `opts` (even `undefined`) clobber it, and the executor falls back to
+   `/bin/sh`, which hangs on Windows.
+2. **No LazyExecutor wrapper.** Return a bare `new NaiveExecutor(...)`, like the
+   factory's `default` case does. The `LazyExecutor` constructor takes a *thunk*
+   (`() => Promise<Executor>`) and calls it later; hand it a value (or a
+   `Promise`) and it throws/stalls when first used — the command appears to hang.
 
 ---
 
-## Integrity Check Details (IDE only)
+## 5. Integrity: `product.json` checksums
 
-The IDE agent code is protected by a two-layer integrity check. The patcher handles this automatically, but here's how it works:
+Current Cursor guards its core files with one integrity mechanism that matters
+for us: `FileIntegrityService` verifies the SHA-256 checksums in `product.json`
+at startup, and on mismatch shows "Your Cursor installation appears to be
+corrupt."
 
-### Layer 1: Extension hash map
+Patching the IDE agent changes a file whose checksum lives in `product.json`, so
+after patching `nupatch` recomputes every `product.json` checksum from the files
+on disk and writes them back. The checksum format is:
 
-`extensionHostProcess.js` has a variable containing a map like:
-
-```javascript
-// Stored without quotes on some keys (minified object literal):
-// cursor-agent-exec":{dist:{"main.js":"<sha256-hex-hash>","621.js":"..."}}
-{
-  "cursor-agent-exec": {
-    dist: {
-      "main.js": "<sha256-hex-hash>"
-    }
-  },
-  // ... other extensions ...
-}
-```
-
-Checked by `_verifyExtensionFiles()` at extension load time. On mismatch, the extension **silently fails** (agent times out).
-
-### Layer 2: product.json checksums
-
-`product.json` has a `checksums` section:
-
-```json
-{
-  "checksums": {
-    "vs/workbench/api/node/extensionHostProcess.js": "<sha256-base64-no-padding>",
-    // ... 5 other core files ...
-  }
-}
-```
-
-Checked by `FileIntegrityService._isPure()` in `workbench.desktop.main.js` at startup. The checksum service uses:
 ```javascript
 crypto.createHash('sha256').update(content).digest('base64').replace(/=+$/, '')
 ```
-On mismatch, shows "Your Cursor installation appears to be corrupt" warning.
 
-### 3-Step patch chain
+`nupatch status` reports `product.json checksums: ALL MATCH` when this is correct.
+The `verify` and `fix-checksums` commands check and repair it independently.
 
-1. Patch `cursor-agent-exec/dist/main.js` (all 4 patches)
-2. Compute new SHA-256 hex hash, replace old hash in `extensionHostProcess.js`
-3. Compute new SHA-256 base64 (stripped `=`) hash of `extensionHostProcess.js`, update in `product.json`
-
-### Files involved
-
-| File | Purpose |
-|------|---------|
-| `...\extensions\cursor-agent-exec\dist\main.js` | Shell execution library (patched) |
-| `...\out\vs\workbench\api\node\extensionHostProcess.js` | SHA-256 **hex** hash map of extensions |
-| `...\product.json` | SHA-256 **base64** (no trailing `=`) checksums of core files |
-
-All under `C:\Users\<user>\AppData\Local\Programs\cursor\resources\app\`.
+> Historical note: older Cursor builds also embedded a SHA-256 of the agent's
+> `main.js` inside `extensionHostProcess.js` and verified it at load. Current
+> builds dropped that per-file hash map, so `nupatch` no longer maintains it.
 
 ---
 
-## Re-applying After Cursor Updates
+## 6. How nupatch finds the code
 
-Cursor updates overwrite all patched files. `.bak` files from the old version should be deleted first. Then re-run:
+`nupatch` never hard-codes minified names. It recovers them from *structural*
+patterns that survive renames, then builds each patch from the recovered names:
+
+| Discovered | From the pattern |
+|------------|------------------|
+| hint var, ShellType enum | `<hint>.includes("zsh")?<enum>.Zsh` |
+| LazyExecutor class | `case <enum>.Zsh: … new <class>(` |
+| NaiveExecutor class | `new <class>(<cwd>, { …, shell: })` |
+| commandExists fn + findActualExecutable call | `function <fn>(a){try{return <call>(a,[]).cmd!==a}` |
+| nu-detection insertion point | `<hint>.includes("pwsh")` (insert before) |
+| system-detection insertion point | first `?<enum>.PowerShell:` (insert after) |
+| factory Naive case anchor | `switch(<fn>(<opts>?.userTerminalHint …)` |
+| userTerminalHint insertion point | `<var>?.shell??` |
+| shell-path fallback | `default:return process.env.SHELL||"/bin/sh"` |
+
+If a future Cursor release restructures the code (not just renames), discovery
+fails loudly and `nupatch` prints what it found and what it couldn't, so you can
+locate the change. To search manually:
+
+- `detectShellType`: `includes("zsh")` near `includes("bash")` near `includes("powershell")`
+- `commandExists`: `findActualExecutable` near `cmd!==`
+- executor factory / getShellExecutablePath: `case <enum>.Zsh:` / `case <enum>.PowerShell:`
+- shell resolver: `?.shell??`
+- shell-path fallback: `process.env.SHELL||"/bin/sh"`
+
+---
+
+## 7. Files, backups, and re-applying
+
+Patched files (all under `…\resources\app\` and the CLI agent's versioned dir):
+
+| File | Role |
+|------|------|
+| `cursor-agent/versions/<latest>/index.js` | CLI agent shell library |
+| `resources/app/extensions/cursor-agent-exec/dist/main.js` | IDE agent shell library |
+| `resources/app/product.json` | SHA-256 (base64, no padding) checksums of core files |
+
+Before modifying a file, `nupatch` copies it to `<file>.bak`. `nupatch revert`
+restores every file from its backup.
+
+Cursor updates overwrite the patched files (and the CLI agent installs into a new
+versioned directory). After an update, delete stale `.bak` files and re-run:
 
 ```
 nupatch patch
 nupatch status
 ```
 
-The regex-based discovery should handle new minified names automatically. If it fails (code was restructured), the patcher prints what it found and what it couldn't find, along with what to search for manually.
-
-**Manual discovery tips** (if regex fails):
-- `detectShellType`: search for `includes("zsh")` near `includes("bash")` near `includes("powershell")`
-- `commandExists` function: search for `findActualExecutable` near `cmd!==`
-- Executor factory: search for `case <enum>.Zsh:` / `case <enum>.Bash:` / `case <enum>.PowerShell:`
-- Shell resolution: search for `?.shell??`
-- `getShellExecutablePath`: search for `process.env.SHELL||"/bin/sh"`
+Structural discovery handles releases that only rename identifiers automatically.
 
 ---
 
-## Discovered Variable Names Reference
+## Commands
 
-Last verified against CLI `v2026.02.27-e7d2ef6` and IDE `v2.5.26`. The patcher discovers these dynamically via regex, so they don't need to be updated manually -- this table is for debugging and manual inspection.
+```
+nupatch patch              # patch both CLI + IDE
+nupatch patch --cli-only   # CLI agent only
+nupatch patch --ide-only   # IDE agent only
+nupatch patch --dry-run    # preview every change without writing
+nupatch status             # show patch state + checksum integrity
+nupatch verify             # check product.json checksums against disk
+nupatch fix-checksums      # recompute product.json checksums
+nupatch revert             # restore all files from backups
+```
 
-| Role | CLI name | IDE name |
-|------|----------|----------|
-| `hintVar` (detectShellType arg) | `t` | `t` |
-| `enumVar` (ShellType enum) | `W` | `ne` |
-| `LazyExecutor` class | `Ae` | `Qe` |
-| `NaiveTerminalExecutor` class | `ve` | `Oe` |
-| `commandExists` function | `Ue` | `ct` |
-| `findActualExecutable` call | `(0,r.findActualExecutable)` | `(0,s.findActualExecutable)` |
-| `detectShellType` function | `Ge` | `ut` |
-| Executor factory function | `He` | `dt` |
-| Shell resolution (`Ue`/`Se`) | `Se` | `Ue` |
-| `getShellExecutablePath` | *(none)* | `ot` |
+## After patching
+
+- **CLI**: Nushell is auto-detected from PATH — no `$env:SHELL` needed.
+- **IDE**: fully quit and relaunch Cursor (not just "Reload Window"); check the
+  system tray for lingering Cursor processes. Set
+  `terminal.integrated.defaultProfile.windows` to your Nushell profile, using a
+  literal `nu.exe` path (VS Code `${env:…}` variables don't always resolve here).

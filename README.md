@@ -15,17 +15,20 @@ The `NaiveTerminalExecutor` (which runs `shell -c "command"`) already exists in 
 
 ## What it does
 
-**CLI agent** (3 patches):
+**CLI agent** (5 patches):
 - Hint-level nushell detection (`includes("nu")`) before the PowerShell check
 - System-level PATH detection (`commandExists("nu")`) as a fallback
 - `case ShellType.Naive` in the executor factory with `findActualExecutable("nu")` shell resolution
+- `case ShellType.Naive` in `getShellExecutablePath()` with PATH-based nu discovery, plus a Windows-safe `default:` fallback (the CLI now ships this function too)
+- `-l` (login) flag prepended when the Naive executor spawns `nu`, so `env.nu`/`config.nu` load
 
-**IDE agent** (4 patches):
+**IDE agent** (5 patches):
 - Same hint-level and system-level nushell detection
 - `userTerminalHint` wired into the shell resolution function
 - `case ShellType.Naive` in `getShellExecutablePath()` with PATH-based nu discovery, plus a Windows-safe `default:` fallback
+- `-l` (login) flag prepended when the Naive executor spawns `nu`
 
-**Integrity chain**: Updates SHA-256 hashes in `extensionHostProcess.js` and `product.json` so Cursor doesn't flag the modification.
+**Integrity**: Recomputes the `product.json` checksums after patching so Cursor's startup integrity check doesn't flag the install as corrupt.
 
 All patches use regex-based pattern discovery to find minified variable names dynamically, so they should survive Cursor updates that only rename variables.
 

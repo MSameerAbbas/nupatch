@@ -3,15 +3,14 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
-use color_eyre::eyre::{self, WrapErr};
-
-use crate::core::{PatchResult, StepResult};
-use crate::util::lazy_re;
+use crate::error::Result;
+use crate::patch::{PatchResult, StepResult};
 
 // ---------------------------------------------------------------------------
 //  Helpers
@@ -35,18 +34,18 @@ fn tab_indent(json: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// SHA-256 hex digest of a file.
-pub fn sha256_hex(path: &Path) -> eyre::Result<String> {
-    let data = fs::read(path)
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    let hash = Sha256::digest(&data);
-    Ok(format!("{:x}", hash))
+pub fn sha256_hex(path: &Path) -> Result<String> {
+    let hash = Sha256::digest(fs::read(path)?);
+    let mut hex = String::with_capacity(hash.len() * 2);
+    for b in hash {
+        let _ = write!(hex, "{b:02x}");
+    }
+    Ok(hex)
 }
 
 /// SHA-256 base64 digest with trailing `=` stripped.
-pub fn sha256_base64_stripped(path: &Path) -> eyre::Result<String> {
-    let data = fs::read(path)
-        .wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    let hash = Sha256::digest(&data);
+pub fn sha256_base64_stripped(path: &Path) -> Result<String> {
+    let hash = Sha256::digest(fs::read(path)?);
     Ok(STANDARD.encode(hash).trim_end_matches('=').to_string())
 }
 
@@ -55,7 +54,7 @@ pub fn sha256_base64_stripped(path: &Path) -> eyre::Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Create a `.bak` copy if one doesn't already exist.
-pub fn backup(filepath: &Path) -> Result<PathBuf, std::io::Error> {
+pub fn backup(filepath: &Path) -> std::io::Result<PathBuf> {
     let bak = bak_path(filepath);
     if !bak.exists() {
         fs::copy(filepath, &bak)?;
@@ -64,7 +63,7 @@ pub fn backup(filepath: &Path) -> Result<PathBuf, std::io::Error> {
 }
 
 /// Restore a file from its `.bak` copy. Returns true on success.
-pub fn restore_from_backup(filepath: &Path) -> Result<bool, std::io::Error> {
+pub fn restore_from_backup(filepath: &Path) -> std::io::Result<bool> {
     let bak = bak_path(filepath);
     if bak.exists() {
         fs::copy(&bak, filepath)?;
@@ -88,96 +87,33 @@ pub fn bak_path(filepath: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-//  Update integrity hashes
+//  Update integrity chain
 // ---------------------------------------------------------------------------
 
-/// Update the SHA-256 integrity chain after patching the IDE agent.
+/// Recompute `product.json` checksums after patching, so Cursor's startup
+/// `FileIntegrityService` does not flag the install as corrupt.
 ///
-/// Returns a `PatchResult` directly (no `eyre::Result` wrapper) so callers
-/// handle a single failure channel, matching the pattern used by the core
-/// patch functions.
+/// Returns a `PatchResult` directly (no `Result` wrapper) so callers handle a
+/// single failure channel, matching the core patch functions. (Older Cursor
+/// builds also embedded a `main.js` hash in `extensionHostProcess.js`; current
+/// builds dropped it, so only the checksum layer needs maintaining.)
 pub fn update_integrity(
-    ide_main: &Path,
-    ehp: Option<&Path>,
     product_json: Option<&Path>,
     cursor_app: Option<&Path>,
     dry_run: bool,
 ) -> PatchResult {
     let mut steps: Vec<StepResult> = Vec::new();
-
     let fail = |steps: Vec<StepResult>| PatchResult { success: false, steps };
 
-    let (Some(ehp), Some(product_json), Some(cursor_app)) = (ehp, product_json, cursor_app)
-    else {
-        return fail(vec![StepResult::fail("Integrity", "Missing EHP / product.json / cursor app path")]);
+    let (Some(product_json), Some(cursor_app)) = (product_json, cursor_app) else {
+        return fail(vec![StepResult::fail("Integrity", "Missing product.json / cursor app path")]);
     };
 
-    // Step 1: compute new hash of patched main.js
-    let new_main_hash = match sha256_hex(ide_main) {
-        Ok(h) => h,
-        Err(e) => {
-            return fail(vec![StepResult::fail("Compute hash", format!("Failed to hash main.js: {e}"))]);
-        }
-    };
-    steps.push(StepResult::ok("Compute hash", format!("main.js SHA-256: {}...", &new_main_hash[..16])));
-
-    // Step 2: update hash in extensionHostProcess.js
-    // Cursor >=3.x removed cursor-agent-exec from the EHP hash map, so
-    // neither the regex nor the backup fallback will find anything -- that's
-    // fine, we just skip.
-    if !dry_run {
-        if let Err(e) = backup(ehp) {
-            return fail(vec![StepResult::fail("EHP backup", format!("Failed to backup EHP: {e}"))]);
-        }
-        if let Err(e) = restore_from_backup(ehp) {
-            return fail(vec![StepResult::fail("EHP restore", format!("Failed to restore EHP: {e}"))]);
-        }
-    }
-
-    let mut ehp_code = match fs::read_to_string(ehp) {
-        Ok(c) => c,
-        Err(e) => {
-            return fail(vec![StepResult::fail("EHP read", format!("Failed to read EHP: {e}"))]);
-        }
-    };
-
-    let hash_re = lazy_re!(
-        r#"(cursor-agent-exec[^}]*dist:\{[^}]*"main\.js":")([a-f0-9]{64})(")"#
-    );
-
-    let ehp_modified = if let Some(caps) = hash_re.captures(&ehp_code).ok().flatten() {
-        let old_hash = caps.get(2).unwrap().as_str();
-        ehp_code = ehp_code.replacen(old_hash, &new_main_hash, 1);
-        steps.push(StepResult::ok("EHP hash", "Replaced hash in extensionHostProcess.js"));
-        true
-    } else {
-        let bak = bak_path(ide_main);
-        let old_hash = bak.exists().then(|| sha256_hex(&bak)).and_then(Result::ok);
-        if let Some(ref h) = old_hash
-            && ehp_code.matches(h.as_str()).count() == 1
-        {
-            ehp_code = ehp_code.replacen(h.as_str(), &new_main_hash, 1);
-            steps.push(StepResult::ok("EHP hash", "Replaced hash via backup comparison"));
-            true
-        } else {
-            steps.push(StepResult::skipped("EHP hash", "No cursor-agent-exec hash in EHP, skipped"));
-            false
-        }
-    };
-
-    if ehp_modified && !dry_run
-        && let Err(e) = fs::write(ehp, &ehp_code)
+    if !dry_run
+        && let Err(e) = backup(product_json)
     {
-        steps.push(StepResult::fail("EHP write", format!("Failed to write EHP: {e}")));
+        steps.push(StepResult::fail("Product backup", format!("Failed to backup product.json: {e}")));
         return fail(steps);
-    }
-
-    // Step 3: update product.json checksums
-    if !dry_run {
-        if let Err(e) = backup(product_json) {
-            steps.push(StepResult::fail("Product backup", format!("Failed to backup product.json: {e}")));
-            return fail(steps);
-        }
     }
 
     let product_text = match fs::read_to_string(product_json) {
@@ -253,7 +189,7 @@ pub fn update_integrity(
 
 /// Read and parse product.json, returning the parsed JSON value and the
 /// checksums map. Shared preamble for verify/fix/update operations.
-fn load_product_checksums(product_json: &Path) -> eyre::Result<(Value, serde_json::Map<String, Value>)> {
+fn load_product_checksums(product_json: &Path) -> Result<(Value, serde_json::Map<String, Value>)> {
     let product_text = fs::read_to_string(product_json)?;
     let product: Value = serde_json::from_str(&product_text)?;
     let checksums = product
@@ -307,7 +243,7 @@ pub struct VerifyResult {
 pub fn verify_checksums(
     product_json: &Path,
     cursor_app: &Path,
-) -> eyre::Result<VerifyResult> {
+) -> Result<VerifyResult> {
     let (_product, checksums) = load_product_checksums(product_json)?;
 
     let mut result = VerifyResult {
@@ -375,7 +311,7 @@ pub struct FixChecksumsResult {
 pub fn fix_checksums(
     product_json: &Path,
     cursor_app: &Path,
-) -> eyre::Result<FixChecksumsResult> {
+) -> Result<FixChecksumsResult> {
     let (mut product, _) = load_product_checksums(product_json)?;
 
     let checksums = match product.get_mut("checksums").and_then(|v| v.as_object_mut()) {
@@ -433,3 +369,109 @@ pub fn fix_checksums(
 
     Ok(result)
 }
+
+// ---------------------------------------------------------------------------
+//  Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write(path: &Path, content: &str) {
+        fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("abc.txt");
+        write(&f, "abc");
+        assert_eq!(
+            sha256_hex(&f).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn sha256_base64_is_stripped_and_43_chars() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("abc.txt");
+        write(&f, "abc");
+        let b64 = sha256_base64_stripped(&f).unwrap();
+        assert_eq!(b64.len(), 43);
+        assert!(!b64.ends_with('='));
+    }
+
+    #[test]
+    fn bak_path_appends_suffix() {
+        assert_eq!(bak_path(Path::new("a/b/main.js")), Path::new("a/b/main.js.bak"));
+    }
+
+    #[test]
+    fn backup_and_restore_roundtrip() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("file.txt");
+        write(&f, "original");
+        backup(&f).unwrap();
+        write(&f, "modified");
+        assert!(restore_from_backup(&f).unwrap());
+        assert_eq!(fs::read_to_string(&f).unwrap(), "original");
+    }
+
+    #[test]
+    fn restore_without_backup_returns_false() {
+        let dir = tempdir().unwrap();
+        let f = dir.path().join("file.txt");
+        write(&f, "x");
+        assert!(!restore_from_backup(&f).unwrap());
+    }
+
+    #[test]
+    fn tab_indent_converts_leading_spaces_only() {
+        let input = "{\n  \"a\": \"two  spaces\",\n    \"b\": 1\n}";
+        let out = tab_indent(input);
+        assert_eq!(out, "{\n\t\"a\": \"two  spaces\",\n\t\t\"b\": 1\n}");
+    }
+
+    /// Build a Cursor-like tree with `out/<file>` and a `product.json` whose
+    /// checksum for that file is stale, then exercise verify + fix.
+    fn checksum_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let app = dir.path().to_path_buf();
+        let out = app.join("out").join("vs");
+        fs::create_dir_all(&out).unwrap();
+        write(&out.join("core.js"), "hello world");
+        let product = app.join("product.json");
+        write(&product, "{\n\t\"checksums\": {\n\t\t\"vs/core.js\": \"stale\"\n\t}\n}");
+        (dir, product, app)
+    }
+
+    #[test]
+    fn verify_reports_mismatch_then_fix_repairs_it() {
+        let (_dir, product, app) = checksum_fixture();
+
+        let before = verify_checksums(&product, &app).unwrap();
+        assert!(!before.all_match);
+        assert_eq!(before.entries.len(), 1);
+        assert!(!before.entries[0].matches);
+
+        let fixed = fix_checksums(&product, &app).unwrap();
+        assert_eq!(fixed.changed_count, 1);
+        assert!(matches!(fixed.entries[0].status, FixStatus::Updated));
+
+        let after = verify_checksums(&product, &app).unwrap();
+        assert!(after.all_match);
+    }
+
+    #[test]
+    fn verify_flags_missing_file() {
+        let (_dir, product, app) = checksum_fixture();
+        fs::remove_file(app.join("out").join("vs").join("core.js")).unwrap();
+        let result = verify_checksums(&product, &app).unwrap();
+        assert!(result.entries[0].missing);
+        assert!(!result.all_match);
+    }
+}
+
